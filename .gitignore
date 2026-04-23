@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.*
+logs/
+*.log
+tmp/
+temp/
+*.csv
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
