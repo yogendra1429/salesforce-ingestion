@@ -1,207 +1,229 @@
 const express = require("express");
 const axios = require("axios");
-const axiosRetry = require("axios-retry").default || require("axios-retry");
+const fs = require("fs");
+const fsPromises = require("fs").promises;
 const Papa = require("papaparse");
-const { v4: uuidv4 } = require('uuid');
-const rateLimit = require("express-rate-limit");
+const path = require("path");
 require('dotenv').config();
-
+ 
 const CONFIG = {
     PORT: process.env.PORT || 3000,
     CHUNK_SIZE: 5 * 1024 * 1024,
-    CONCURRENCY: 3,
-    MAX_PARALLEL_JOBS: 2,
-    MAX_QUEUE_SIZE: process.env.MAX_QUEUE_SIZE || 20,
-    MAX_FILE_SIZE: (process.env.MAX_FILE_SIZE_GB || 2) * 1024 * 1024 * 1024,
-    JOB_TIMEOUT_MS: (process.env.JOB_TIMEOUT_HOURS || 2) * 60 * 60 * 1000,
+    CONCURRENCY: 3,              
     DATASET_ALIAS: process.env.DATASET_ALIAS,
-    RECIPE_ID: process.env.RECIPE_ID, // Use 15 or 18 char ID starting with 05i
+    RECIPE_ID: process.env.RECIPE_ID,
     ORG_DOMAIN: process.env.ORG_DOMAIN,
-    API_KEY: process.env.API_KEY,
+    API_KEY: process.env.API_KEY, // Add this in your .env file
     AUTH: {
         client_id: process.env.CLIENT_ID,
         client_secret: process.env.CLIENT_SECRET,
-        grant_type: "client_credentials" 
+        grant_type: "client_credentials"
     },
-    API_VERSION: "v60.0"
+    API_VERSION: "v60.0",
+    MAX_RETRIES: 3
 };
-
+ 
 class Logger {
-    static info(msg, context = {}) { 
-        console.log(JSON.stringify({ timestamp: new Date().toISOString(), level: 'INFO', reqId: context.reqId, jobId: context.jobId, url: context.url, msg }));
+    static info(msg) { console.log(`[${new Date().toISOString()}] INFO: ${msg}`); }
+    static warn(msg) { console.warn(`[${new Date().toISOString()}] WARN: ${msg}`); }
+    static error(msg, err) {
+        console.error(`[${new Date().toISOString()}] ERROR: ${msg}`);
+        if (err?.response) console.error(JSON.stringify(err.response.data, null, 2));
     }
-    static error(msg, err, context = {}) {
-        const errorDetail = err?.response?.data || err?.message || err;
-        console.error(JSON.stringify({ timestamp: new Date().toISOString(), level: 'ERROR', reqId: context.reqId, jobId: context.jobId, url: context.url, msg, error: errorDetail }));
+    static stats(part) {
+        const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+        console.log(`[Stats] Part ${part} Uploaded | RAM: ${mem}MB`);
     }
 }
-
+ 
 class SalesforceClient {
     constructor() {
         this.session = axios.create({ baseURL: CONFIG.ORG_DOMAIN, timeout: 300000 });
-        axiosRetry(this.session, {
-            retries: 5,
-            retryDelay: axiosRetry.exponentialDelay,
-            retryCondition: (error) => axiosRetry.isNetworkOrIdempotentRequestError(error) || error.response?.status === 429 || error.response?.status >= 500
-        });
-        this.session.interceptors.response.use(
-            response => response,
-            async (error) => {
-                if (error.config && error.response && error.response.status === 401) {
-                    await this.authenticate();
-                    error.config.headers['Authorization'] = this.session.defaults.headers.common['Authorization'];
-                    return this.session.request(error.config);
-                }
-                return Promise.reject(error);
-            }
-        );
     }
-
+ 
     async authenticate() {
-        const params = new URLSearchParams(CONFIG.AUTH);
-        const res = await axios.post(`${CONFIG.ORG_DOMAIN}/services/oauth2/token`, params);
-        this.session.defaults.headers.common = { Authorization: `Bearer ${res.data.access_token}`, "Content-Type": "application/json" };
+        try {
+            const params = new URLSearchParams(CONFIG.AUTH);
+            const res = await axios.post(`${CONFIG.ORG_DOMAIN}/services/oauth2/token`, params);
+            this.session.defaults.headers.common = {
+                Authorization: `Bearer ${res.data.access_token}`,
+                "Content-Type": "application/json"
+            };
+            Logger.info("Salesforce Auth Successful.");
+            return true;
+        } catch (e) { throw new Error(`Auth Failed: ${e.message}`); }
     }
-
-    async generateMetadata(headerLine) {
-        const columns = Papa.parse(headerLine.replace(/^\uFEFF/, '').trim()).data[0] || [];
-        const numericFields = ["operation_count", "rows_processed", "request_size", "response_size", "http_status_code", "num_fields", "event_count"];
+ 
+    async call(fn, retries = CONFIG.MAX_RETRIES) {
+        try {
+            return await fn();
+        } catch (err) {
+            if (err.response?.status === 401 && retries > 0) {
+                await this.authenticate();
+                return this.call(fn, retries - 1);
+            }
+            if (retries > 0) {
+                await new Promise(r => setTimeout(r, 5000));
+                return this.call(fn, retries - 1);
+            }
+            throw err;
+        }
+    }
+ 
+    async getMetadata(filePath) {
+        const buffer = Buffer.alloc(65536);
+        const fd = await fsPromises.open(filePath, 'r');
+        await fd.read(buffer, 0, 65536, 0);
+        await fd.close();
+ 
+        const firstLine = buffer.toString().split('\n')[0].replace(/^\uFEFF/, '').trim();
+        const columns = Papa.parse(firstLine).data[0] || [];
+       
+        const numericFields = [
+            "operation_count", "rows_processed", "request_size",
+            "response_size", "http_status_code", "num_fields", "event_count"
+        ];
+ 
         const fields = columns.map(col => {
             const name = col.trim().replace(/[^a-zA-Z0-9]/g, '_').replace(/^_+|_+$/g, '');
             const lower = name.toLowerCase();
-            if (lower.includes("timestamp") || lower.includes("date")) return { name, label: col, type: "Date", format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", fullyQualifiedName: name };
-            if (numericFields.includes(lower)) return { name, label: col, type: "Numeric", precision: 18, scale: 0, defaultValue: "0", fullyQualifiedName: name };
+           
+            if (lower.includes("timestamp") || lower.includes("date")) {
+                return { name, label: col, type: "Date", format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", fullyQualifiedName: name };
+            }
+           
+            if (numericFields.includes(lower)) {
+                return {
+                    name, label: col, type: "Numeric", precision: 18, scale: 0, defaultValue: "0", fullyQualifiedName: name
+                };
+            }
+           
             return { name, label: col, type: "Text", precision: 255, fullyQualifiedName: name };
         });
-        return Buffer.from(JSON.stringify({ fileFormat: { charsetName: "UTF-8", fieldsEnclosedBy: "\"", numberOfLinesToSkip: 1 }, objects: [{ connector: "CSV", fullyQualifiedName: CONFIG.DATASET_ALIAS, label: CONFIG.DATASET_ALIAS, name: CONFIG.DATASET_ALIAS, fields }] })).toString("base64");
+ 
+        return Buffer.from(JSON.stringify({
+            fileFormat: { charsetName: "UTF-8" },
+            objects: [{
+                connector: "CSV",
+                fullyQualifiedName: CONFIG.DATASET_ALIAS,
+                label: CONFIG.DATASET_ALIAS,
+                name: CONFIG.DATASET_ALIAS,
+                fields
+            }]
+        })).toString("base64");
     }
 }
-
+ 
 const sf = new SalesforceClient();
 const app = express();
-const taskQueue = [];
-let activeWorkers = 0;
-
-const runWorker = async () => {
-    if (activeWorkers >= CONFIG.MAX_PARALLEL_JOBS || taskQueue.length === 0) return;
-    activeWorkers++;
-    const task = taskQueue.shift();
-    try { await task(); } finally {
-        activeWorkers--;
-        setImmediate(runWorker);
+let isBusy = false;
+ 
+app.use(express.json());
+ 
+// --- Middleware for API Key Check ---
+const authenticateApiKey = (req, res, next) => {
+    const userApiKey = req.headers['x-api-key'];
+   
+    if (!CONFIG.API_KEY) {
+        Logger.warn("Server API_KEY is not set in .env. Security is disabled.");
+        return next();
     }
+ 
+    if (!userApiKey || userApiKey !== CONFIG.API_KEY) {
+        Logger.warn(`Unauthorized access attempt from IP: ${req.ip}`);
+        return res.status(401).json({ error: "Unauthorized: Invalid or missing API Key" });
+    }
+    next();
 };
-
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
-app.use(express.json({ limit: '1mb' }));
-
-app.post("/ingest", async (req, res) => {
-    const apiKey = req.headers['x-api-key'];
-    if (CONFIG.API_KEY && apiKey !== CONFIG.API_KEY) return res.status(401).json({ error: "Unauthorized" });
-
-    const rawUrls = req.body.csv_urls;
-    if (!Array.isArray(rawUrls) || rawUrls.length === 0) return res.status(400).json({ error: "csv_urls must be a non-empty array" });
-    const csv_urls = [...new Set(rawUrls.map(u => u.trim()))];
-
-    if (taskQueue.length >= CONFIG.MAX_QUEUE_SIZE) return res.status(503).json({ error: "Server busy" });
-
-    const reqId = uuidv4();
-    res.status(202).json({ status: "Queued", requestId: reqId });
-
-    taskQueue.push(async () => {
-        const results = [];
-        const context = { reqId };
-
-        for (const url of csv_urls) {
-            context.url = url;
-            const ingestPromise = (async () => {
-                let jobId = null;
-                try {
-                    const response = await axios({ method: 'get', url, responseType: 'stream' });
-                    const inputStream = response.data;
-                    let internalBuffer = Buffer.alloc(0);
-                    let partCounter = 1;
-                    const activePool = new Set();
-
-                    for await (const chunk of inputStream) {
-                        internalBuffer = Buffer.concat([internalBuffer, chunk]);
-                        if (!jobId && internalBuffer.includes('\n')) {
-                            const headerLine = internalBuffer.subarray(0, internalBuffer.indexOf('\n')).toString();
-                            const metadata = await sf.generateMetadata(headerLine);
-                            const job = await sf.session.post(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData`, {
-                                EdgemartAlias: CONFIG.DATASET_ALIAS, MetadataJson: metadata, Operation: "Append", Action: "None", Format: "Csv"
-                            });
-                            jobId = job.data.id;
-                            context.jobId = jobId;
-                        }
-
-                        while (internalBuffer.length >= CONFIG.CHUNK_SIZE) {
-                            const uploadData = internalBuffer.subarray(0, CONFIG.CHUNK_SIZE);
-                            internalBuffer = internalBuffer.subarray(CONFIG.CHUNK_SIZE);
-                            const task = sf.session.post(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalDataPart`, {
-                                InsightsExternalDataId: jobId, PartNumber: partCounter++, DataFile: uploadData.toString("base64")
-                            }).then(() => activePool.delete(task));
-                            activePool.add(task);
-                            if (activePool.size >= CONFIG.CONCURRENCY) await Promise.race(activePool);
-                        }
-                    }
-                    if (internalBuffer.length > 0 && jobId) {
-                        await sf.session.post(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalDataPart`, {
-                            InsightsExternalDataId: jobId, PartNumber: partCounter, DataFile: internalBuffer.toString("base64")
-                        });
-                    }
-                    await Promise.all(activePool);
-                    if (jobId) {
-                        await sf.session.patch(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData/${jobId}`, { Action: "Process" });
-                        let status = "InProgress";
-                        while (["New", "InProgress", "Queued"].includes(status)) {
-                            await new Promise(r => setTimeout(r, 20000));
-                            const poll = await sf.session.get(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData/${jobId}`);
-                            status = poll.data.Status;
-                        }
-                    }
-                    results.push({ url, status: "success" });
-                } catch (err) {
-                    Logger.error("Ingestion failed", err, context);
-                    results.push({ url, status: "failed", error: err.message });
-                }
-            })();
-            await ingestPromise; // Critical: Wait for file to finish before next one
-        }
-
-        // --- BULLETPROOF RECIPE TRIGGER ---
+ 
+app.post("/ingest", authenticateApiKey, async (req, res) => {
+    if (!req.body || !Array.isArray(req.body.csv_urls)) {
+        return res.status(400).json({ error: "Invalid Request: csv_urls array missing" });
+    }
+ 
+    if (isBusy) return res.status(429).json({ error: "Pipeline Busy" });
+   
+    const { csv_urls } = req.body;
+    res.status(202).json({ status: "Accepted", operation: "Append" });
+    isBusy = true;
+ 
+    (async () => {
+        let tempFile = "";
         try {
             await sf.authenticate();
-            const recipeList = await sf.session.get(`/services/data/${CONFIG.API_VERSION}/wave/recipes`);
-            // Find the recipe by 15-char prefix to avoid ID length issues
-            const targetRecipe = recipeList.data.recipes.find(r => 
-                r.id.startsWith(CONFIG.RECIPE_ID.substring(0, 15))
-            );
-
-            if (targetRecipe) {
-                // Use containerId (02K) if available, otherwise targetDataflowId, fallback to ID
-                const triggerId = targetRecipe.containerId || targetRecipe.targetDataflowId || targetRecipe.id;
-                
-                Logger.info(`Found Recipe: ${targetRecipe.label}. Triggering ID: ${triggerId}`, context);
-                
-                await sf.session.post(`/services/data/${CONFIG.API_VERSION}/wave/dataflowjobs`, { 
-                    dataflowId: triggerId, 
-                    command: "start" 
-                });
-                Logger.info("Recipe triggered successfully", context);
-            } else {
-                Logger.error(`Recipe with ID ${CONFIG.RECIPE_ID} not found in org.`, null, context);
+ 
+            for (const url of csv_urls) {
+                tempFile = path.join(__dirname, `ingest_tmp_${Date.now()}.csv`);
+               
+                Logger.info(`Downloading: ${url}`);
+                const dl = await axios({ url: url.trim(), method: "GET", responseType: "stream" });
+                const writer = fs.createWriteStream(tempFile);
+                dl.data.pipe(writer);
+                await new Promise((resolve, reject) => { writer.on("finish", resolve); writer.on("error", reject); });
+ 
+                const metadata = await sf.getMetadata(tempFile);
+               
+                Logger.info("Initializing Append Job...");
+                const job = await sf.call(() => sf.session.post(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData`, {
+                    EdgemartAlias: CONFIG.DATASET_ALIAS,
+                    Operation: "Append",
+                    Action: "None",
+                    Format: "Csv",
+                    MetadataJson: metadata
+                }));
+ 
+                const jobId = job.data.id;
+                const fileStream = fs.createReadStream(tempFile, { highWaterMark: CONFIG.CHUNK_SIZE });
+               
+                let partCounter = 1;
+                let activePool = [];
+ 
+                for await (const chunk of fileStream) {
+                    const currentPart = partCounter++;
+                    const task = sf.call(() => sf.session.post(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalDataPart`, {
+                        InsightsExternalDataId: jobId, PartNumber: currentPart, DataFile: chunk.toString("base64")
+                    })).then(() => Logger.stats(currentPart));
+ 
+                    activePool.push(task);
+                    if (activePool.length >= CONFIG.CONCURRENCY) {
+                        await Promise.race(activePool);
+                        activePool = activePool.filter(p => p.status === 'pending');
+                    }
+                }
+                await Promise.all(activePool);
+ 
+                Logger.info("Finalizing Salesforce Processing...");
+                await sf.session.patch(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData/${jobId}`, { Action: "Process" });
+ 
+                let status = "InProgress";
+                while (["New", "InProgress", "Queued"].includes(status)) {
+                    await new Promise(r => setTimeout(r, 30000));
+                    const poll = await sf.session.get(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData/${jobId}`);
+                    status = poll.data.Status;
+                    Logger.info(`Job Status: ${status}`);
+                    if (status === "Failed") throw new Error(poll.data.StatusMessage);
+                }
+               
+                await fsPromises.unlink(tempFile).catch(() => {});
+                tempFile = "";
             }
+ 
+            Logger.info("All Append Jobs Successful. Triggering Recipe...");
+            const recipeList = await sf.call(() => sf.session.get(`/services/data/${CONFIG.API_VERSION}/wave/recipes`));
+            const targetRecipe = recipeList.data.recipes.find(r => r.id.startsWith(CONFIG.RECIPE_ID.substring(0, 15)));
+           
+            await sf.session.post(`/services/data/${CONFIG.API_VERSION}/wave/dataflowjobs`, {
+                dataflowId: targetRecipe?.targetDataflowId || CONFIG.RECIPE_ID, command: "start"
+            });
+            Logger.info("PIPELINE COMPLETE");
+ 
         } catch (err) {
-            // Check if recipe is already running
-            if (err.response?.data?.[0]?.message?.includes("already running")) {
-                Logger.info("Recipe is already running. Skipping trigger.", context);
-            } else {
-                Logger.error("Recipe Trigger Failed", err, context);
-            }
+            Logger.error("Pipeline Crashed", err);
+            if (tempFile) await fsPromises.unlink(tempFile).catch(() => {});
+        } finally {
+            isBusy = false;
         }
-    });
-    runWorker();
+    })();
 });
-
-app.listen(CONFIG.PORT, () => Logger.info(`Server running on port ${CONFIG.PORT}`));
+ 
+app.listen(CONFIG.PORT, () => Logger.info(`Service running on port ${CONFIG.PORT}`));
