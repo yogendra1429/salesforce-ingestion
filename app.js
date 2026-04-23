@@ -11,11 +11,11 @@ const CONFIG = {
     CHUNK_SIZE: 5 * 1024 * 1024,
     CONCURRENCY: 3,
     MAX_PARALLEL_JOBS: 2,
-    MAX_QUEUE_SIZE: process.env.MAX_QUEUE_SIZE || 20, // FIX: In-memory queue limitation
-    MAX_FILE_SIZE: (process.env.MAX_FILE_SIZE_GB || 2) * 1024 * 1024 * 1024, // FIX: File size limit protection
-    JOB_TIMEOUT_MS: (process.env.JOB_TIMEOUT_HOURS || 2) * 60 * 60 * 1000, // FIX: Global job timeout
+    MAX_QUEUE_SIZE: process.env.MAX_QUEUE_SIZE || 20,
+    MAX_FILE_SIZE: (process.env.MAX_FILE_SIZE_GB || 2) * 1024 * 1024 * 1024,
+    JOB_TIMEOUT_MS: (process.env.JOB_TIMEOUT_HOURS || 2) * 60 * 60 * 1000,
     DATASET_ALIAS: process.env.DATASET_ALIAS,
-    RECIPE_ID: process.env.RECIPE_ID,
+    RECIPE_ID: process.env.RECIPE_ID, // Use 15 or 18 char ID starting with 05i
     ORG_DOMAIN: process.env.ORG_DOMAIN,
     API_KEY: process.env.API_KEY,
     AUTH: {
@@ -63,17 +63,8 @@ class SalesforceClient {
         this.session.defaults.headers.common = { Authorization: `Bearer ${res.data.access_token}`, "Content-Type": "application/json" };
     }
 
-    async getExistingSchema() {
-        try {
-            const res = await this.session.get(`/services/data/${CONFIG.API_VERSION}/wave/datasets/${CONFIG.DATASET_ALIAS}`);
-            const versionData = await this.session.get(res.data.currentVersionUrl);
-            return versionData.data.xmd.objects[0].fields.map(f => f.name.toLowerCase());
-        } catch (e) { return null; }
-    }
-
     async generateMetadata(headerLine) {
         const columns = Papa.parse(headerLine.replace(/^\uFEFF/, '').trim()).data[0] || [];
-        if (columns.length === 0) throw new Error("CSV contains no columns");
         const numericFields = ["operation_count", "rows_processed", "request_size", "response_size", "http_status_code", "num_fields", "event_count"];
         const fields = columns.map(col => {
             const name = col.trim().replace(/[^a-zA-Z0-9]/g, '_').replace(/^_+|_+$/g, '');
@@ -101,137 +92,116 @@ const runWorker = async () => {
     }
 };
 
-// FIX: Health Endpoint
-app.get("/health", (req, res) => {
-    res.json({ status: "UP", activeWorkers, queueLength: taskQueue.length, maxParallel: CONFIG.MAX_PARALLEL_JOBS });
-});
-
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 app.use(express.json({ limit: '1mb' }));
 
-const authMiddleware = (req, res, next) => {
+app.post("/ingest", async (req, res) => {
     const apiKey = req.headers['x-api-key'];
-    if (!apiKey || apiKey !== CONFIG.API_KEY) return res.status(401).json({ error: "Unauthorized" });
-    next();
-};
+    if (CONFIG.API_KEY && apiKey !== CONFIG.API_KEY) return res.status(401).json({ error: "Unauthorized" });
 
-app.post("/ingest", authMiddleware, async (req, res) => {
-    // FIX: Duplicate File Protection (dedupe URLs in request)
     const rawUrls = req.body.csv_urls;
     if (!Array.isArray(rawUrls) || rawUrls.length === 0) return res.status(400).json({ error: "csv_urls must be a non-empty array" });
     const csv_urls = [...new Set(rawUrls.map(u => u.trim()))];
 
-    // FIX: Queue size limit rejection
-    if (taskQueue.length >= CONFIG.MAX_QUEUE_SIZE) return res.status(503).json({ error: "Server busy, queue full" });
+    if (taskQueue.length >= CONFIG.MAX_QUEUE_SIZE) return res.status(503).json({ error: "Server busy" });
 
     const reqId = uuidv4();
-    res.status(202).json({ status: "Queued", requestId: reqId, deduplicatedCount: csv_urls.length });
+    res.status(202).json({ status: "Queued", requestId: reqId });
 
     taskQueue.push(async () => {
-        const results = []; // FIX: Partial Failure Handling (track results per URL)
+        const results = [];
         const context = { reqId };
 
         for (const url of csv_urls) {
             context.url = url;
-            Logger.info("Starting ingestion", context); // FIX: Logging start
-
-            // FIX: Timeout protection per file
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("File processing timed out")), CONFIG.JOB_TIMEOUT_MS));
-
             const ingestPromise = (async () => {
                 let jobId = null;
                 try {
-                    const response = await axios({ method: 'get', url, responseType: 'stream', timeout: 300000 });
-                    
-                    // FIX: File size limit protection
-                    const contentLength = parseInt(response.headers['content-length'], 10);
-                    if (contentLength > CONFIG.MAX_FILE_SIZE) throw new Error(`File too large: ${(contentLength / 1024 / 1024 / 1024).toFixed(2)}GB`);
-
+                    const response = await axios({ method: 'get', url, responseType: 'stream' });
                     const inputStream = response.data;
-                    let internalBuffer = Buffer.alloc(0); // FIX: Memory optimization (incremental buffer)
+                    let internalBuffer = Buffer.alloc(0);
                     let partCounter = 1;
-                    let headerColsCount = 0;
                     const activePool = new Set();
 
                     for await (const chunk of inputStream) {
                         internalBuffer = Buffer.concat([internalBuffer, chunk]);
-
                         if (!jobId && internalBuffer.includes('\n')) {
-                            const firstNewLine = internalBuffer.indexOf('\n');
-                            const headerLine = internalBuffer.subarray(0, firstNewLine).toString();
-                            headerColsCount = (Papa.parse(headerLine).data[0] || []).length; // FIX: Row consistency validation
-                            
+                            const headerLine = internalBuffer.subarray(0, internalBuffer.indexOf('\n')).toString();
                             const metadata = await sf.generateMetadata(headerLine);
                             const job = await sf.session.post(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData`, {
                                 EdgemartAlias: CONFIG.DATASET_ALIAS, MetadataJson: metadata, Operation: "Append", Action: "None", Format: "Csv"
                             });
                             jobId = job.data.id;
                             context.jobId = jobId;
-                            Logger.info("Created Salesforce Job", context);
                         }
 
-                        // FIX: Memory optimization (process only valid chunks)
                         while (internalBuffer.length >= CONFIG.CHUNK_SIZE) {
-                            if (activePool.size >= CONFIG.CONCURRENCY) {
-                                inputStream.pause();
-                                await Promise.race(activePool);
-                                inputStream.resume();
-                            }
-
                             const uploadData = internalBuffer.subarray(0, CONFIG.CHUNK_SIZE);
                             internalBuffer = internalBuffer.subarray(CONFIG.CHUNK_SIZE);
-                            
                             const task = sf.session.post(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalDataPart`, {
                                 InsightsExternalDataId: jobId, PartNumber: partCounter++, DataFile: uploadData.toString("base64")
                             }).then(() => activePool.delete(task));
                             activePool.add(task);
+                            if (activePool.size >= CONFIG.CONCURRENCY) await Promise.race(activePool);
                         }
                     }
-
                     if (internalBuffer.length > 0 && jobId) {
                         await sf.session.post(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalDataPart`, {
                             InsightsExternalDataId: jobId, PartNumber: partCounter, DataFile: internalBuffer.toString("base64")
                         });
                     }
-
                     await Promise.all(activePool);
                     if (jobId) {
                         await sf.session.patch(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData/${jobId}`, { Action: "Process" });
                         let status = "InProgress";
                         while (["New", "InProgress", "Queued"].includes(status)) {
-                            await new Promise(r => setTimeout(r, 15000));
+                            await new Promise(r => setTimeout(r, 20000));
                             const poll = await sf.session.get(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData/${jobId}`);
                             status = poll.data.Status;
-                            if (status === "Failed") throw new Error(poll.data.StatusMessage || "Salesforce processing failed");
                         }
                     }
-                    results.push({ url, status: "success", jobId });
-                    Logger.info("Ingestion completed", context); // FIX: Logging end
+                    results.push({ url, status: "success" });
                 } catch (err) {
+                    Logger.error("Ingestion failed", err, context);
                     results.push({ url, status: "failed", error: err.message });
-                    Logger.error("Ingestion failed per URL", err, context);
-                    if (jobId) await sf.session.patch(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData/${jobId}`, { Action: "Abort" }).catch(() => {});
                 }
             })();
-
-            await Promise.race([ingestPromise, timeoutPromise]);
+            await ingestPromise; // Critical: Wait for file to finish before next one
         }
 
-        // FIX: Recipe Match Fix (Exact ID Match)
+        // --- BULLETPROOF RECIPE TRIGGER ---
         try {
             await sf.authenticate();
             const recipeList = await sf.session.get(`/services/data/${CONFIG.API_VERSION}/wave/recipes`);
-            const targetRecipe = recipeList.data.recipes.find(r => r.id === CONFIG.RECIPE_ID); // FIX: Exact match
+            // Find the recipe by 15-char prefix to avoid ID length issues
+            const targetRecipe = recipeList.data.recipes.find(r => 
+                r.id.startsWith(CONFIG.RECIPE_ID.substring(0, 15))
+            );
 
             if (targetRecipe) {
-                await sf.session.post(`/services/data/${CONFIG.API_VERSION}/wave/dataflowjobs`, { dataflowId: targetRecipe.id, command: "start" });
-                Logger.info("Recipe triggered", context);
+                // Use containerId (02K) if available, otherwise targetDataflowId, fallback to ID
+                const triggerId = targetRecipe.containerId || targetRecipe.targetDataflowId || targetRecipe.id;
+                
+                Logger.info(`Found Recipe: ${targetRecipe.label}. Triggering ID: ${triggerId}`, context);
+                
+                await sf.session.post(`/services/data/${CONFIG.API_VERSION}/wave/dataflowjobs`, { 
+                    dataflowId: triggerId, 
+                    command: "start" 
+                });
+                Logger.info("Recipe triggered successfully", context);
+            } else {
+                Logger.error(`Recipe with ID ${CONFIG.RECIPE_ID} not found in org.`, null, context);
             }
-        } catch (err) { Logger.error("Recipe Trigger Failed", err, context); }
-        
-        Logger.info("Pipeline Execution Summary", { reqId, results }); // FIX: Structured final log
+        } catch (err) {
+            // Check if recipe is already running
+            if (err.response?.data?.[0]?.message?.includes("already running")) {
+                Logger.info("Recipe is already running. Skipping trigger.", context);
+            } else {
+                Logger.error("Recipe Trigger Failed", err, context);
+            }
+        }
     });
     runWorker();
 });
 
-app.listen(CONFIG.PORT, () => Logger.info(`Server online on port ${CONFIG.PORT}`));
+app.listen(CONFIG.PORT, () => Logger.info(`Server running on port ${CONFIG.PORT}`));
