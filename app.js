@@ -141,7 +141,7 @@ app.post("/ingest", async (req, res) => {
                         const job = await sf.session.post(`/services/data/${CONFIG.API_VERSION}/sobjects/InsightsExternalData`, {
                             EdgemartAlias: CONFIG.DATASET_ALIAS,
                             MetadataJson: metadata,
-                            Operation: "Append", Action: "None", Format: "Csv"
+                            Operation: "Overwrite", Action: "None", Format: "Csv"
                         });
                         jobId = job.data.id;
                     }
