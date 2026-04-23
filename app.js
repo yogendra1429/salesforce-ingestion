@@ -41,37 +41,68 @@ class SalesforceClient {
         console.log("[Auth] Salesforce Session Authenticated.");
     }
 
-    async getMetadata(headerLine) {
+   async getMetadata(headerLine) {
         let fields = [];
         try {
             const ds = await this.session.get(`/services/data/${CONFIG.API_VERSION}/wave/datasets/${CONFIG.DATASET_ALIAS}`);
             const version = await this.session.get(ds.data.currentVersionUrl);
             fields = version.data.xmd.objects[0].fields.map(f => ({
-                name: f.name, label: f.label || f.name, type: f.type,
-                format: f.format, precision: f.precision, scale: f.scale, fullyQualifiedName: f.name
+                name: f.name,
+                label: f.label || f.name,
+                type: f.type,
+                format: f.format,
+                precision: f.precision,
+                scale: f.scale,
+                fullyQualifiedName: f.name
             }));
             console.log(`[Schema] Syncing with existing dataset: ${CONFIG.DATASET_ALIAS}`);
         } catch (e) {
             console.log(`[Schema] Generating new metadata from CSV header.`);
-            const columns = headerLine.replace(/^\uFEFF/, '').split(',').map(c => c.trim().replace(/"/g, ''));
+            
+            // 1. Clean the header: Remove BOM and trim whitespace/newlines
+            const cleanHeader = headerLine.replace(/^\uFEFF/, '').trim();
+            
+            // 2. Robust split: Handle quotes and commas correctly
+            const columns = cleanHeader.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(c => 
+                c.trim().replace(/^"|"$/g, '')
+            );
+
             const numericFields = ["operation_count", "rows_processed", "request_size", "response_size", "http_status_code", "num_fields", "event_count", "ui_event_sequence_num"];
             
-            fields = columns.map(col => {
-                const name = col.replace(/[^a-zA-Z0-9]/g, '_');
-                const lower = name.toLowerCase();
-                if (lower.includes("timestamp") || lower.includes("date")) {
-                    return { name, label: col, type: "Date", format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", fullyQualifiedName: name };
-                }
-                if (numericFields.includes(lower)) {
-                    return { name, label: col, type: "Numeric", precision: 18, scale: 0, defaultValue: "0", fullyQualifiedName: name };
-                }
-                return { name, label: col, type: "Text", precision: 255, fullyQualifiedName: name };
-            });
+            fields = columns
+                .filter(col => col.length > 0) // Ensure no empty field names
+                .map(col => {
+                    // Create a valid Salesforce API name (alphanumeric and underscores only)
+                    const safeName = col.replace(/[^a-zA-Z0-9]/g, '_').replace(/^_+|_+$/g, '');
+                    const lower = safeName.toLowerCase();
+                    
+                    if (lower.includes("timestamp") || lower.includes("date")) {
+                        return { name: safeName, label: col, type: "Date", format: "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", fullyQualifiedName: safeName };
+                    }
+                    if (numericFields.includes(lower)) {
+                        return { name: safeName, label: col, type: "Numeric", precision: 18, scale: 0, defaultValue: "0", fullyQualifiedName: safeName };
+                    }
+                    return { name: safeName, label: col, type: "Text", precision: 255, fullyQualifiedName: safeName };
+                });
         }
-        return Buffer.from(JSON.stringify({
-            fileFormat: { charsetName: "UTF-8", fieldsEnclosedBy: "\"", numberOfLinesToSkip: 1 },
-            objects: [{ connector: "CSV", fullyQualifiedName: CONFIG.DATASET_ALIAS, label: CONFIG.DATASET_ALIAS, name: CONFIG.DATASET_ALIAS, fields }]
-        })).toString("base64");
+
+        // Final Metadata Structure
+        const metadataObj = {
+            fileFormat: {
+                charsetName: "UTF-8",
+                fieldsEnclosedBy: "\"",
+                numberOfLinesToSkip: 1 // Note: Some API versions prefer this inside 'fileFormat'
+            },
+            objects: [{
+                connector: "CSV",
+                fullyQualifiedName: CONFIG.DATASET_ALIAS,
+                label: CONFIG.DATASET_ALIAS,
+                name: CONFIG.DATASET_ALIAS,
+                fields: fields
+            }]
+        };
+
+        return Buffer.from(JSON.stringify(metadataObj)).toString("base64");
     }
 
     // Integrated your working logic
