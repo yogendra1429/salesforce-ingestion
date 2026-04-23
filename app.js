@@ -41,38 +41,31 @@ class SalesforceClient {
         console.log("[Auth] Salesforce Session Authenticated.");
     }
 
-   async getMetadata(headerLine) {
+  async getMetadata(headerLine) {
         let fields = [];
         try {
             const ds = await this.session.get(`/services/data/${CONFIG.API_VERSION}/wave/datasets/${CONFIG.DATASET_ALIAS}`);
             const version = await this.session.get(ds.data.currentVersionUrl);
             fields = version.data.xmd.objects[0].fields.map(f => ({
-                name: f.name,
-                label: f.label || f.name,
-                type: f.type,
-                format: f.format,
-                precision: f.precision,
-                scale: f.scale,
-                fullyQualifiedName: f.name
+                name: f.name, label: f.label || f.name, type: f.type,
+                format: f.format, precision: f.precision, scale: f.scale, fullyQualifiedName: f.name
             }));
             console.log(`[Schema] Syncing with existing dataset: ${CONFIG.DATASET_ALIAS}`);
         } catch (e) {
-            console.log(`[Schema] Generating new metadata from CSV header.`);
+            console.log(`[Schema] Parsing header for new metadata...`);
             
-            // 1. Clean the header: Remove BOM and trim whitespace/newlines
+            // Clean BOM and invisible characters
             const cleanHeader = headerLine.replace(/^\uFEFF/, '').trim();
             
-            // 2. Robust split: Handle quotes and commas correctly
-            const columns = cleanHeader.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(c => 
-                c.trim().replace(/^"|"$/g, '')
-            );
-
+            // Split by comma, handling potential quotes
+            const rawColumns = cleanHeader.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+            
             const numericFields = ["operation_count", "rows_processed", "request_size", "response_size", "http_status_code", "num_fields", "event_count", "ui_event_sequence_num"];
             
-            fields = columns
-                .filter(col => col.length > 0) // Ensure no empty field names
+            fields = rawColumns
+                .map(c => c.trim().replace(/^"|"$/g, ''))
+                .filter(c => c.length > 0) // REMOVE EMPTY STRINGS
                 .map(col => {
-                    // Create a valid Salesforce API name (alphanumeric and underscores only)
                     const safeName = col.replace(/[^a-zA-Z0-9]/g, '_').replace(/^_+|_+$/g, '');
                     const lower = safeName.toLowerCase();
                     
@@ -82,17 +75,24 @@ class SalesforceClient {
                     if (numericFields.includes(lower)) {
                         return { name: safeName, label: col, type: "Numeric", precision: 18, scale: 0, defaultValue: "0", fullyQualifiedName: safeName };
                     }
+                    // Default to Text
                     return { name: safeName, label: col, type: "Text", precision: 255, fullyQualifiedName: safeName };
                 });
+
+            // SECURITY CHECK: If still no fields, add a dummy one to prevent Salesforce rejection
+            if (fields.length === 0) {
+                fields.push({ name: "External_ID", label: "External ID", type: "Text", precision: 255, fullyQualifiedName: "External_ID" });
+            }
         }
 
-        // Final Metadata Structure
         const metadataObj = {
             fileFormat: {
                 charsetName: "UTF-8",
                 fieldsEnclosedBy: "\"",
-                numberOfLinesToSkip: 1 // Note: Some API versions prefer this inside 'fileFormat'
+                fieldsDelimitedBy: ","
             },
+            // CRITICAL: Move this outside fileFormat for v60.0 compatibility
+            numberOfLinesToSkip: 1, 
             objects: [{
                 connector: "CSV",
                 fullyQualifiedName: CONFIG.DATASET_ALIAS,
