@@ -4,8 +4,7 @@ const axiosRetry = require("axios-retry").default || require("axios-retry");
 const rateLimit = require("express-rate-limit");
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
-const app = express();
-app.set('trust proxy', 1);
+
 const CONFIG = {
     PORT: process.env.PORT || 3000,
     CHUNK_SIZE: 5 * 1024 * 1024, // 5MB
@@ -129,6 +128,7 @@ class SalesforceClient {
 
 const sf = new SalesforceClient();
 const app = express();
+app.set('trust proxy', 1);
 app.use(limiter);
 app.use(express.json());
 
