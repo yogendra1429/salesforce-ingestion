@@ -4,7 +4,8 @@ const axiosRetry = require("axios-retry").default || require("axios-retry");
 const rateLimit = require("express-rate-limit");
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
-
+const app = express();
+app.set('trust proxy', 1);
 const CONFIG = {
     PORT: process.env.PORT || 3000,
     CHUNK_SIZE: 5 * 1024 * 1024, // 5MB
